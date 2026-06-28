@@ -3,6 +3,7 @@ import os
 import logging
 import math
 import string
+from datetime import datetime
 from collections import Counter
 import torch
 import random
@@ -58,6 +59,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def add_file_logger(prefix):
+    os.makedirs("logs", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join("logs", f"{prefix}_{timestamp}.log")
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logging.getLogger().addHandler(handler)
+    logger.info("File logging enabled: %s", log_path)
+    return log_path
+
 def evaluate_loss(model, ans_model, data_loader, criterion, device, batch_size=4):
     logger.info("Evaluate Model: start validation pass")
     model.eval()
@@ -66,13 +78,13 @@ def evaluate_loss(model, ans_model, data_loader, criterion, device, batch_size=4
     with torch.no_grad():
         for batch in data_loader:
             images, questions, answers = batch
-            if len(images) == batch_size:
+            if len(images) > 0:
                 images = images.to(device)
 
-                predicted_tokens = model(images, questions).float()
-                ans_embedds = ans_model(answers)
+                decoder_inputs, ans_embedds = ans_model.prepare_decoder_batch(answers)
+                predicted_tokens = model(images, questions, decoder_inputs).float()
 
-                loss = criterion(predicted_tokens.view(-1, 50257), ans_embedds.view(-1))
+                loss = criterion(predicted_tokens.reshape(-1, predicted_tokens.size(-1)), ans_embedds.reshape(-1))
                 total_loss += loss.item()
                 num_batches += 1
 
@@ -98,6 +110,7 @@ def train_model(
     val_loader=None,
     early_stopping_patience=None,
     checkpoint_path=None,
+    scheduler=None,
 ):
     smoother = SmoothingFunction()
 
@@ -126,27 +139,33 @@ def train_model(
 
         for batch_idx, batch in enumerate(train_loader):
             images, questions, answers = batch
-            if len(images) == batch_size:
+            if len(images) > 0:
                 images = images.to(device)
-
-                predicted_tokens = model(images, questions).float()
-                ans_embedds = ans_model(answers)
+                current_batch_size = len(images)
+                decoder_inputs, ans_embedds = ans_model.prepare_decoder_batch(answers)
+                predicted_tokens = model(images, questions, decoder_inputs).float()
 
                 references = [answer.strip() for answer in answers]
                 hypotheses = []
 
-                for i in range(batch_size):
-                    sentence_predicted = torch.argmax(predicted_tokens[i], axis=1)
+                for i in range(current_batch_size):
+                    valid_length = int(ans_embedds[i].ne(-100).sum().item())
+                    sentence_predicted = torch.argmax(
+                        predicted_tokens[i, :valid_length], axis=1
+                    )
                     predicted_sentence = tokenizer.decode(sentence_predicted, skip_special_tokens=True)
                     hypotheses.append(predicted_sentence.strip())
 
                 # BLEU score calculations
-                bleu_score_1 = corpus_bleu([[ref] for ref in references], hypotheses, weights=(1, 0, 0, 0), smoothing_function=smoother.method1)
-                bleu_score_2 = corpus_bleu([[ref] for ref in references], hypotheses, weights=(0.5, 0.5, 0, 0), smoothing_function=smoother.method1)
-                bleu_score_3 = corpus_bleu([[ref] for ref in references], hypotheses, weights=(1/3, 1/3, 1/3, 0), smoothing_function=smoother.method1)
-                bleu_score_4 = corpus_bleu([[ref] for ref in references], hypotheses, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoother.method1)
+                tokenized_references = [[normalize_text(ref).split()] for ref in references]
+                tokenized_hypotheses = [normalize_text(hyp).split() for hyp in hypotheses]
+                bleu_score_1 = corpus_bleu(tokenized_references, tokenized_hypotheses, weights=(1, 0, 0, 0), smoothing_function=smoother.method1)
+                bleu_score_2 = corpus_bleu(tokenized_references, tokenized_hypotheses, weights=(0.5, 0.5, 0, 0), smoothing_function=smoother.method1)
+                bleu_score_3 = corpus_bleu(tokenized_references, tokenized_hypotheses, weights=(1/3, 1/3, 1/3, 0), smoothing_function=smoother.method1)
+                bleu_score_4 = corpus_bleu(tokenized_references, tokenized_hypotheses, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoother.method1)
 
-                c, r = sum(len(hypothesis) for hypothesis in hypotheses), sum(len(reference) for reference in references)
+                c = sum(len(hypothesis) for hypothesis in tokenized_hypotheses)
+                r = sum(len(reference[0]) for reference in tokenized_references)
                 bp = brevity_penalty(c, r)
                 bleu_scores_all = [bleu_score_1, bleu_score_2, bleu_score_3, bleu_score_4]
                 valid_bleu_scores = [score for score in bleu_scores_all if score > 0]
@@ -163,16 +182,29 @@ def train_model(
                 for pred, ref in zip(hypotheses, references):
                     batch_accuracy += accuracy_score(pred, ref)
                     batch_f1 += f1_score(pred, ref)
-                total_accuracy += batch_accuracy / batch_size
-                total_f1 += batch_f1 / batch_size
+                total_accuracy += batch_accuracy / current_batch_size
+                total_f1 += batch_f1 / current_batch_size
 
                 # Loss calculation
-                loss = criterion(predicted_tokens.view(-1, 50257), ans_embedds.view(-1))
+                loss = criterion(predicted_tokens.reshape(-1, predicted_tokens.size(-1)), ans_embedds.reshape(-1))
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
 
                 total_loss += loss.item()
+
+                if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
+                    logger.info(
+                        "Train batch | epoch=%d/%d | batch=%d/%d | size=%d | loss=%.4f",
+                        epoch + 1,
+                        num_epochs,
+                        batch_idx + 1,
+                        len(train_loader),
+                        current_batch_size,
+                        loss.item(),
+                    )
 
                 # Log periodically
                 if (batch_idx + 1) % print_every == 0:
@@ -181,7 +213,7 @@ def train_model(
                     print(
                         f"BLEU@1: {bleu_score_1:.4f}, BLEU@2: {bleu_score_2:.4f}, BLEU@3: {bleu_score_3:.4f}, "
                         f"BLEU@4: {bleu_score_4:.4f}, BLEU-SCORES: {bleu_score_total:.4f}, "
-                        f"Accuracy: {batch_accuracy / batch_size:.4f}, F1-score: {batch_f1 / batch_size:.4f}"
+                        f"Accuracy: {batch_accuracy / current_batch_size:.4f}, F1-score: {batch_f1 / current_batch_size:.4f}"
                     )
 
         avg_epoch_loss = total_loss / len(train_loader)
@@ -259,6 +291,8 @@ if __name__=="__main__":
     parser.add_argument("--use-dual-gating", action="store_true", help="Enable DualGatedFusion for ablation")
     args = parser.parse_args()
 
+    log_path = add_file_logger("train")
+
     logger.info("Load model: tokenizer from %s", config.TEXT_DIR)
     tokenizer = AutoTokenizer.from_pretrained(config.TEXT_DIR)
     logger.info("Load model: VQAModel")
@@ -276,7 +310,7 @@ if __name__=="__main__":
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=0,
-        num_training_steps=int(len(train_loader) * 20),
+        num_training_steps=max(1, int(len(train_loader) * args.epochs)),
     )
 
     logger.info("Load model: answer embedding module")
@@ -295,9 +329,11 @@ if __name__=="__main__":
         val_loader=val_loader,
         early_stopping_patience=args.early_stopping,
         checkpoint_path=args.checkpoint,
+        scheduler=scheduler,
     )
     history_path = os.path.join("outputs", "training_history.json")
     save_training_history(training_history, history_path)
     plot_training_history(training_history, output_dir="outputs")
     logger.info("Train Pipeline: saved training curves and metrics in outputs/")
     logger.info("Train Pipeline: completed")
+    print(f"Training log saved to: {log_path}")

@@ -55,6 +55,9 @@ class VQAModel(nn.Module):
             num_heads=num_heads,
             layers=['m']
         ).to(config.DEVICE)
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.position_embedding = nn.Embedding(config.MAX_LEN, d_model)
+        self.context_norm = nn.LayerNorm(d_model)
 
         self.mlp = nn.Sequential(
             nn.Dropout(0.2),
@@ -80,7 +83,7 @@ class VQAModel(nn.Module):
             f"Unsupported image output type from encoder: {type(image_outputs)}"
         )
 
-    def forward(self, images, questions, max_len=config.MAX_LEN):
+    def encode_context(self, images, questions):
         image_outputs = self.image_model(images.to(config.DEVICE))
         image_embeddings = self._extract_image_tensor(image_outputs)
         batch_size = images.size(0)
@@ -101,9 +104,71 @@ class VQAModel(nn.Module):
                 ques_embedds.to(config.DEVICE),
             )
 
+        # Each SAN hop updates the query used by the following hop.
+        query = ques_embedds.to(config.DEVICE)
         for att_layer in self.san_model:
-            att_embedds = att_layer(image_embedds.to(config.DEVICE), ques_embedds.to(config.DEVICE))
-        y = att_embedds.unsqueeze(1).expand(-1, max_len, -1)
-        out, _ = self.decoder(y)
-        output_logits = self.mlp(out)
-        return output_logits # [32, 64, 50257]
+            attended = att_layer(image_embedds.to(config.DEVICE), query)
+            query = attended.unsqueeze(1)
+        return self.context_norm(query.squeeze(1))
+
+    def decode(self, context, decoder_input_ids):
+        seq_len = decoder_input_ids.size(1)
+        if seq_len > config.MAX_LEN:
+            raise ValueError(f"Decoder length {seq_len} exceeds MAX_LEN={config.MAX_LEN}")
+        positions = torch.arange(seq_len, device=decoder_input_ids.device).unsqueeze(0)
+        decoder_inputs = (
+            self.token_embedding(decoder_input_ids)
+            + self.position_embedding(positions)
+            + context.unsqueeze(1)
+        )
+        out, _ = self.decoder(decoder_inputs)
+        return self.mlp(out)
+
+    def forward(self, images, questions, decoder_input_ids=None, max_len=config.MAX_LEN):
+        context = self.encode_context(images, questions)
+        if decoder_input_ids is None:
+            decoder_input_ids = torch.full(
+                (images.size(0), max_len),
+                tokenizer.eos_token_id,
+                dtype=torch.long,
+                device=images.device,
+            )
+        return self.decode(context, decoder_input_ids.to(context.device))
+
+    @torch.no_grad()
+    def generate(self, images, questions, max_len=config.MAX_LEN):
+        context = self.encode_context(images, questions)
+        batch_size = images.size(0)
+        current_tokens = torch.full(
+            (batch_size,),
+            tokenizer.eos_token_id,
+            dtype=torch.long,
+            device=context.device,
+        )
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=context.device)
+        state = None
+        generated = []
+
+        for position in range(max_len):
+            pos = torch.full(
+                (batch_size,), position, dtype=torch.long, device=context.device
+            )
+            step_input = (
+                self.token_embedding(current_tokens)
+                + self.position_embedding(pos)
+                + context
+            ).unsqueeze(1)
+            step_output, state = self.decoder(step_input, state)
+            next_tokens = self.mlp(step_output[:, -1]).argmax(dim=-1)
+            next_tokens = torch.where(
+                finished,
+                torch.full_like(next_tokens, tokenizer.eos_token_id),
+                next_tokens,
+            )
+            generated.append(next_tokens)
+            finished |= next_tokens.eq(tokenizer.eos_token_id)
+            current_tokens = next_tokens
+            if finished.all():
+                break
+
+        return torch.stack(generated, dim=1)

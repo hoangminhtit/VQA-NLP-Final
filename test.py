@@ -3,6 +3,7 @@ import os
 import math
 import logging
 import string
+from datetime import datetime
 from collections import Counter
 import torch
 from PIL import Image
@@ -54,6 +55,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def add_file_logger(prefix):
+    os.makedirs("logs", exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join("logs", f"{prefix}_{timestamp}.log")
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logging.getLogger().addHandler(handler)
+    logger.info("File logging enabled: %s", log_path)
+    return log_path
+
 tokenizer = AutoTokenizer.from_pretrained(config.TEXT_DIR)
 
 def predict_batch(model, image_paths, questions, device):
@@ -68,7 +80,7 @@ def predict_batch(model, image_paths, questions, device):
         images = [transform(Image.open(image_path).convert("RGB")) for image_path in image_paths]
         images = torch.stack(images).to(device)  # Stack thành batch
 
-        predicted_tokens = model(images, questions)
+        predicted_tokens = model.generate(images, questions)
         predicted_sentences = []
 
         for i in range(len(questions)):
@@ -105,33 +117,43 @@ def evaluate_test(model, ans_model, data_loader, device, batch_size):
     total_accuracy = 0.0
     total_f1 = 0.0
     num_batches = 0
+    inference_logged = 0
     criterion = torch.nn.CrossEntropyLoss()
     smoother = SmoothingFunction()
 
     with torch.no_grad():
         for batch in data_loader:
             images, questions, answers = batch
-            if len(images) != batch_size:
-                continue
-
             images = images.to(device)
-            predicted_tokens = model(images, questions).float()
-            ans_embedds = ans_model(answers)
+            decoder_inputs, ans_embedds = ans_model.prepare_decoder_batch(answers)
+            teacher_forced_logits = model(images, questions, decoder_inputs).float()
+            generated_tokens = model.generate(images, questions)
 
             references = [answer.strip() for answer in answers]
             hypotheses = []
-            for i in range(batch_size):
-                sentence_predicted = torch.argmax(predicted_tokens[i], axis=1)
-                predicted_sentence = tokenizer.decode(sentence_predicted, skip_special_tokens=True)
+            for i in range(len(images)):
+                predicted_sentence = tokenizer.decode(generated_tokens[i], skip_special_tokens=True)
                 hypotheses.append(predicted_sentence.strip())
 
-            bleu_score_1 = corpus_bleu([[ref] for ref in references], hypotheses, weights=(1, 0, 0, 0), smoothing_function=smoother.method1)
-            bleu_score_2 = corpus_bleu([[ref] for ref in references], hypotheses, weights=(0.5, 0.5, 0, 0), smoothing_function=smoother.method1)
-            bleu_score_3 = corpus_bleu([[ref] for ref in references], hypotheses, weights=(1/3, 1/3, 1/3, 0), smoothing_function=smoother.method1)
-            bleu_score_4 = corpus_bleu([[ref] for ref in references], hypotheses, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoother.method1)
+                if inference_logged < 50:
+                    logger.info(
+                        "Test inference %03d | question=%r | reference=%r | prediction=%r",
+                        inference_logged + 1,
+                        questions[i],
+                        references[i],
+                        hypotheses[-1],
+                    )
+                    inference_logged += 1
 
-            c = sum(len(hypothesis) for hypothesis in hypotheses)
-            r = sum(len(reference) for reference in references)
+            tokenized_references = [[normalize_text(ref).split()] for ref in references]
+            tokenized_hypotheses = [normalize_text(hyp).split() for hyp in hypotheses]
+            bleu_score_1 = corpus_bleu(tokenized_references, tokenized_hypotheses, weights=(1, 0, 0, 0), smoothing_function=smoother.method1)
+            bleu_score_2 = corpus_bleu(tokenized_references, tokenized_hypotheses, weights=(0.5, 0.5, 0, 0), smoothing_function=smoother.method1)
+            bleu_score_3 = corpus_bleu(tokenized_references, tokenized_hypotheses, weights=(1/3, 1/3, 1/3, 0), smoothing_function=smoother.method1)
+            bleu_score_4 = corpus_bleu(tokenized_references, tokenized_hypotheses, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoother.method1)
+
+            c = sum(len(hypothesis) for hypothesis in tokenized_hypotheses)
+            r = sum(len(reference[0]) for reference in tokenized_references)
             bp = brevity_penalty(c, r)
             bleu_scores_all = [bleu_score_1, bleu_score_2, bleu_score_3, bleu_score_4]
             valid_bleu_scores = [score for score in bleu_scores_all if score > 0]
@@ -142,10 +164,14 @@ def evaluate_test(model, ans_model, data_loader, device, batch_size):
             for pred, ref in zip(hypotheses, references):
                 batch_accuracy += accuracy_score(pred, ref)
                 batch_f1 += f1_score(pred, ref)
-            total_accuracy += batch_accuracy / batch_size
-            total_f1 += batch_f1 / batch_size
+            current_batch_size = len(images)
+            total_accuracy += batch_accuracy / current_batch_size
+            total_f1 += batch_f1 / current_batch_size
 
-            loss = criterion(predicted_tokens.view(-1, 50257), ans_embedds.view(-1))
+            loss = criterion(
+                teacher_forced_logits.reshape(-1, teacher_forced_logits.size(-1)),
+                ans_embedds.reshape(-1),
+            )
             total_loss += loss.item()
             total_bleu_1 += bleu_score_1
             total_bleu_2 += bleu_score_2
@@ -153,6 +179,14 @@ def evaluate_test(model, ans_model, data_loader, device, batch_size):
             total_bleu_4 += bleu_score_4
             total_bleu_scores += bleu_score_total
             num_batches += 1
+            logger.info(
+                "Test batch | batch=%d | size=%d | loss=%.4f | accuracy=%.4f | f1=%.4f",
+                num_batches,
+                current_batch_size,
+                loss.item(),
+                batch_accuracy / current_batch_size,
+                batch_f1 / current_batch_size,
+            )
 
     if num_batches == 0:
         logger.info("Test Pipeline: no full batch found, returning zeros")
@@ -198,11 +232,15 @@ if __name__ == "__main__":
     parser.add_argument("--use-dual-gating", action="store_true", help="Enable DualGatedFusion for ablation")
     args = parser.parse_args()
 
+    log_path = add_file_logger("test")
+
     model = load_model(args.checkpoint, device=config.DEVICE, use_dual_gating=args.use_dual_gating)
 
     _, _, test_loader = build_dataloaders(args.dataset, batch_size=args.batch_size)
     ans_model = AnsEmbedding().to(config.DEVICE)
 
-    evaluate_test(model, ans_model, test_loader, device=config.DEVICE, batch_size=args.batch_size)
+    metrics = evaluate_test(model, ans_model, test_loader, device=config.DEVICE, batch_size=args.batch_size)
+    logger.info("Final test metrics: %s", metrics)
+    print(f"Test log (including first 50 inferences) saved to: {log_path}")
 
     # predicted_answers = predict_batch(model, image_paths, questions, device=config.DEVICE)

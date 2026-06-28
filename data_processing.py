@@ -65,8 +65,6 @@ def build_dataloaders(dataset_name=DATASET_NAME, batch_size=None, val_split=None
     return train_loader, val_loader, test_loader
 
 
-train_loader, val_loader, test_loader = build_dataloaders()
-
 if __name__ == "__main__":
     train_loader, _, _ = build_dataloaders()
     train_dataset = train_loader.dataset

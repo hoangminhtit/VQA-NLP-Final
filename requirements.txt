@@ -3,4 +3,5 @@ matplotlib
 torch
 torchvision
 transformers
+datasets
 nltk
