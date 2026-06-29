@@ -77,6 +77,14 @@ python test.py \
   --use-dual-gating
 ```
 
+Training writes timestamped progress logs to `logs/train_*.log`. Testing writes
+metrics to `logs/test_*.log` and records the question, reference answer, and
+generated prediction for the first 50 test samples.
+
+> The corrected decoder uses matrix-memory mLSTM states and autoregressive token
+> generation. Checkpoints produced by the older vector-memory implementation are
+> not architecture-compatible and must be retrained.
+
 ### Example Usage
 Uncomment the example code in `test.py` to test the model with sample images and questions.
 
