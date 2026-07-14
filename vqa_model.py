@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch
 from transformers import AutoTokenizer
 from features_extraction import ImageEmbedding, QuesEmbedding
-from sans import StackedAttentionNets
+from sans import AdaptiveGatedFusion, SAGLayer, SGAGLayer
 from xlstm_decoder import xLSTM
 
 torch.cuda.empty_cache()
@@ -39,15 +39,26 @@ class DualGatedFusion(nn.Module):
         return fused_image_tokens, fused_text_token
 
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size=len(vocab), output_size=768, d_model=768,
-                 num_heads=8, hidden_size=768,num_att_layers=4, use_dual_gating=False):
+    def __init__(self, vocab_size=len(vocab), output_size=768, d_model=512,
+                 num_heads=8, hidden_size=512, num_att_layers=6, use_dual_gating=False):
         super(VQAModel, self).__init__()
         self.use_dual_gating = use_dual_gating
         self.image_model = ImageEmbedding(output_size=output_size).to(config.DEVICE)
-        self.ques_model = QuesEmbedding(output_size=output_size).to(config.DEVICE)
+        self.ques_model = QuesEmbedding(
+            input_size=output_size,
+            output_size=output_size,
+            return_sequence=True,
+        ).to(config.DEVICE)
+        self.image_proj = nn.Linear(output_size, d_model)
+        self.question_proj = nn.Linear(output_size, d_model)
         self.dual_gated_fusion = DualGatedFusion(d_model=d_model).to(config.DEVICE)
-        self.san_model = nn.ModuleList(
-                        [StackedAttentionNets(d=d_model, k=768) for _ in range(num_att_layers)]).to(config.DEVICE)
+        self.sag_encoder = nn.ModuleList(
+            [SAGLayer(d_model=d_model, num_heads=num_heads) for _ in range(num_att_layers)]
+        )
+        self.sgag_decoder = nn.ModuleList(
+            [SGAGLayer(d_model=d_model, num_heads=num_heads) for _ in range(num_att_layers)]
+        )
+        self.fusion = AdaptiveGatedFusion(d_model=d_model)
 
         self.decoder = xLSTM(
             input_size=d_model,
@@ -93,23 +104,41 @@ class VQAModel(nn.Module):
             image_embedds = image_embeddings
         else:
             # [batch, hidden] -> [batch, 1, hidden]
-            image_embedds = image_embeddings.reshape(batch_size, 768, -1).permute(0, 2, 1)
+            image_embedds = image_embeddings.reshape(batch_size, image_embeddings.size(-1), -1).permute(0, 2, 1)
 
-        ques_embeddings = self.ques_model(questions)
-        ques_embedds = ques_embeddings.unsqueeze(1)
+        ques_embeddings, question_mask = self.ques_model(
+            questions,
+            return_attention_mask=True,
+        )
+        if ques_embeddings.dim() == 2:
+            ques_embeddings = ques_embeddings.unsqueeze(1)
+        question_padding_mask = question_mask.eq(0)
+
+        image_embedds = self.image_proj(image_embedds.to(config.DEVICE))
+        ques_embedds = self.question_proj(ques_embeddings.to(config.DEVICE))
 
         if self.use_dual_gating:
             image_embedds, ques_embedds = self.dual_gated_fusion(
                 image_embedds.to(config.DEVICE),
-                ques_embedds.to(config.DEVICE),
+                ques_embedds.mean(dim=1, keepdim=True).to(config.DEVICE),
             )
+            question_padding_mask = None
 
-        # Each SAN hop updates the query used by the following hop.
-        query = ques_embedds.to(config.DEVICE)
-        for att_layer in self.san_model:
-            attended = att_layer(image_embedds.to(config.DEVICE), query)
-            query = attended.unsqueeze(1)
-        return self.context_norm(query.squeeze(1))
+        for sag_layer in self.sag_encoder:
+            ques_embedds = sag_layer(ques_embedds, key_padding_mask=question_padding_mask)
+        for sgag_layer in self.sgag_decoder:
+            image_embedds = sgag_layer(
+                image_embedds,
+                ques_embedds,
+                question_padding_mask=question_padding_mask,
+            )
+        return self.context_norm(
+            self.fusion(
+                ques_embedds,
+                image_embedds,
+                question_padding_mask=question_padding_mask,
+            )
+        )
 
     def decode(self, context, decoder_input_ids):
         seq_len = decoder_input_ids.size(1)

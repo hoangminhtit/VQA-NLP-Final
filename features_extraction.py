@@ -39,8 +39,14 @@ class ImageEmbedding(nn.Module):
         return outputs
 
 class QuesEmbedding(nn.Module):
-    def __init__(self, input_size=config.d_model, output_size=config.d_model):
+    def __init__(
+        self,
+        input_size=config.d_model,
+        output_size=config.d_model,
+        return_sequence=False,
+    ):
         super(QuesEmbedding, self).__init__()
+        self.return_sequence = return_sequence
         self.tokenizer = AutoTokenizer.from_pretrained(config.TEXT_DIR)
         self.tokenizer.pad_token = self.tokenizer.eos_token 
         self.text_model = GPTNeoModel.from_pretrained(config.TEXT_DIR)
@@ -52,7 +58,7 @@ class QuesEmbedding(nn.Module):
         )
 
 
-    def forward(self, ques):
+    def forward(self, ques, return_attention_mask=False):
         if isinstance(ques, tuple):
             ques = list(ques)
         elif isinstance(ques, str):
@@ -69,8 +75,16 @@ class QuesEmbedding(nn.Module):
         ques = self.text_model(**tokenized_input.to(config.DEVICE)).last_hidden_state
 
         output, _ = self.xlstm(ques)
+        if self.return_sequence:
+            if return_attention_mask:
+                return output, tokenized_input["attention_mask"].to(output.device)
+            return output
+
         mask = tokenized_input["attention_mask"].to(output.device).unsqueeze(-1)
-        return (output * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+        pooled = (output * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+        if return_attention_mask:
+            return pooled, tokenized_input["attention_mask"].to(output.device)
+        return pooled
     
 class AnsEmbedding(nn.Module):
     def __init__(self, input_size=config.d_model):
