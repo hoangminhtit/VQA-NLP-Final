@@ -1,5 +1,5 @@
 from config import config
-from transformers import AutoTokenizer, SiglipProcessor, SiglipModel, GPTNeoModel
+from transformers import AutoImageProcessor, AutoTokenizer, BertModel, CLIPVisionModel
 import torch
 import torch.nn as nn
 from xlstm_decoder import xLSTM
@@ -7,16 +7,16 @@ from xlstm_decoder import xLSTM
 class ImageEmbedding(nn.Module):
     def __init__(self, output_size=config.d_model):
         super(ImageEmbedding, self).__init__()
-        self.process = SiglipProcessor.from_pretrained(config.IMG_DIR)
-        self.model = SiglipModel.from_pretrained(config.IMG_DIR)
+        self.process = AutoImageProcessor.from_pretrained(config.IMG_DIR)
+        self.model = CLIPVisionModel.from_pretrained(config.IMG_DIR)
         self.model.requires_grad_(False)
         self.register_buffer(
             "image_mean",
-            torch.tensor(self.process.image_processor.image_mean).view(1, 3, 1, 1),
+            torch.tensor(self.process.image_mean).view(1, 3, 1, 1),
         )
         self.register_buffer(
             "image_std",
-            torch.tensor(self.process.image_processor.image_std).view(1, 3, 1, 1),
+            torch.tensor(self.process.image_std).view(1, 3, 1, 1),
         )
 
     def train(self, mode=True):
@@ -33,7 +33,7 @@ class ImageEmbedding(nn.Module):
         with torch.no_grad():
             # Preserve patch tokens for spatial attention instead of returning one
             # pooled image vector from get_image_features().
-            outputs = self.model.vision_model(
+            outputs = self.model(
                 pixel_values=pixel_values
             ).last_hidden_state
         return outputs
@@ -48,8 +48,7 @@ class QuesEmbedding(nn.Module):
         super(QuesEmbedding, self).__init__()
         self.return_sequence = return_sequence
         self.tokenizer = AutoTokenizer.from_pretrained(config.TEXT_DIR)
-        self.tokenizer.pad_token = self.tokenizer.eos_token 
-        self.text_model = GPTNeoModel.from_pretrained(config.TEXT_DIR)
+        self.text_model = BertModel.from_pretrained(config.TEXT_DIR)
         self.xlstm = xLSTM(
             input_size=input_size,
             hidden_size=output_size,
@@ -91,8 +90,9 @@ class AnsEmbedding(nn.Module):
         super(AnsEmbedding, self).__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(config.TEXT_DIR)
         if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.bos_token_id = self.tokenizer.eos_token_id
+            self.tokenizer.pad_token = self.tokenizer.sep_token
+        self.bos_token_id = self.tokenizer.cls_token_id
+        self.eos_token_id = self.tokenizer.sep_token_id
 
     def prepare_decoder_batch(self, ans, max_length=config.MAX_LEN):
         if isinstance(ans, tuple):
@@ -118,7 +118,7 @@ class AnsEmbedding(nn.Module):
             (batch_size, max_length), -100, dtype=torch.long, device=config.DEVICE
         )
         for row, token_ids in enumerate(encoded["input_ids"]):
-            targets = token_ids + [self.tokenizer.eos_token_id]
+            targets = token_ids + [self.eos_token_id]
             length = len(targets)
             labels[row, :length] = torch.tensor(targets, device=config.DEVICE)
             if length > 1:

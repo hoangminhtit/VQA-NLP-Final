@@ -9,7 +9,12 @@ from xlstm_decoder import xLSTM
 torch.cuda.empty_cache()
 
 tokenizer = AutoTokenizer.from_pretrained(config.TEXT_DIR)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.sep_token
 vocab = tokenizer.get_vocab()
+
+BOS_TOKEN_ID = tokenizer.cls_token_id
+EOS_TOKEN_ID = tokenizer.sep_token_id
 
 class DualGatedFusion(nn.Module):
     def __init__(self, d_model=768, dropout=0.1):
@@ -158,7 +163,7 @@ class VQAModel(nn.Module):
         if decoder_input_ids is None:
             decoder_input_ids = torch.full(
                 (images.size(0), max_len),
-                tokenizer.eos_token_id,
+                BOS_TOKEN_ID,
                 dtype=torch.long,
                 device=images.device,
             )
@@ -170,7 +175,7 @@ class VQAModel(nn.Module):
         batch_size = images.size(0)
         current_tokens = torch.full(
             (batch_size,),
-            tokenizer.eos_token_id,
+            BOS_TOKEN_ID,
             dtype=torch.long,
             device=context.device,
         )
@@ -191,11 +196,11 @@ class VQAModel(nn.Module):
             next_tokens = self.mlp(step_output[:, -1]).argmax(dim=-1)
             next_tokens = torch.where(
                 finished,
-                torch.full_like(next_tokens, tokenizer.eos_token_id),
+                torch.full_like(next_tokens, EOS_TOKEN_ID),
                 next_tokens,
             )
             generated.append(next_tokens)
-            finished |= next_tokens.eq(tokenizer.eos_token_id)
+            finished |= next_tokens.eq(EOS_TOKEN_ID)
             current_tokens = next_tokens
             if finished.all():
                 break

@@ -5,7 +5,7 @@ class config:
     BATCH_SIZE = 4
     DATASET_NAME = "flaviagiammarino/path-vqa"
     CHECKPOINT_PATH = "checkpoints/best_model.pt"
-    IMG_DIR = 'google/siglip-base-patch16-224'
-    TEXT_DIR = 'EleutherAI/gpt-neo-125m'
+    IMG_DIR = 'openai/clip-vit-base-patch32'
+    TEXT_DIR = 'bert-base-uncased'
     MAX_LEN = 64
     d_model = 768
